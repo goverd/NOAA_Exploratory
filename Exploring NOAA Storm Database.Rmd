@@ -1,0 +1,479 @@
+---
+title: "Exploring NOAA Storm Database"
+author: "Valentin Goverdovsky"
+date: "1 May 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r echo=FALSE, results='hide'}
+library(lubridate)
+library(ggplot2)
+library(RCurl)
+library(Quandl)
+library(choroplethr)
+library(reshape2)
+library(dplyr)
+
+# Setup directories
+wDir <- "/Users/Valentin/Documents/Education/Data Incubator/Interview"
+dataURL <- c("ftp://ftp.ncdc.noaa.gov/pub/data/swdi/stormevents/csvfiles/")
+detailDir <- "Details"
+fatalDir <- "Fatalities"
+challengeDir <- "Challenge Data"
+setwd(wDir)
+
+# Setup dates of interest
+sDate <- "01/01/1996"
+eDate <- "31/12/2015"
+sYear <- year(dmy(sDate))
+eYear <- year(dmy(eDate))
+```
+
+## Reminder of earlier exploratory plots from Storm_data_exploration.R
+
+The first plot shows cumulative crop damages for every year from 1996 to 2014, highlighting the top 3 contributors for each year.
+
+```{r chPlot1, echo=FALSE, fig.align='center', cache=TRUE, fig.retina=2, fig.asp=1/2, fig.width=10}
+stackedBar <- read.csv(file.path(wDir, challengeDir,"top3Events.csv"))
+p <- ggplot(stackedBar, aes(x = startYear, y = n/1000000000, fill = EVENT_TYPE)) +
+    geom_bar(stat = "identity", colour="black", size = 0.1) +
+    scale_x_continuous(breaks = seq(sYear, eYear, 2)) +
+    labs(list(fill="Event Type", x = "Year", y = 'Crop damages in $B'))
+
+barPalette <- c("#1f78b4", "#fdbf6f", "#b2df8a", "#b15928", "#fb9a99", "#313695", 
+                "#a6cee3", "#ff7f00", "#cab2d6", "#6a3d9a", "#33a02c", "#ffffff",
+                "#e31a1c", "#74add1", "#5e4fa2")
+
+p+scale_fill_manual(values=barPalette)
+```
+
+Plot 2 is the map of the USA with each state coloured according to the severity of the cumulative crop damages from droughts covering years 1996 -- 2014.
+
+```{r chPlot2, echo=FALSE, fig.align='center', cache=TRUE, fig.retina=2, fig.asp=1/2, fig.width=10}
+map <- read.csv(file.path(wDir, challengeDir, "map.csv"))
+region<-c(tolower(map$STATE))
+value<-c(map$droughtDmgState)
+mapDf<-data.frame(region,value)
+
+mapPalette <- c("#ffffd4", "#fee391", "#fec44f", "#fe9929", "#d95f0e", "#993404")
+        choro = StateChoropleth$new(mapDf)
+        choro$ggplot_scale = scale_fill_manual(name="Crop Damages US$", values=mapPalette, drop=FALSE)
+        choro$render()
+```
+
+## Further exploring the dataset
+
+### Automatic file update
+Previous plots have been produced, by first downloading the data, uncompressing it and then loading the CSV files into R. NOAA regularly updates the files on the server with new data and also revises old files, thus a routine has been written to automatically check the FTP server for any file updates, download those and archive the old files. Furthermore, all files are kept in the compressed format, thus significantly reducing the local space requirement.
+
+```{r getData, echo=FALSE, cache=TRUE}
+# Get new data and archive old
+getData <- function(remoteFiles, localFiles, wD, Year, dataUrl, fileDir) {
+    archiveDir <- "Archive"
+    
+    if (!dir.exists(file.path(wD, fileDir))) {
+        dir.create(file.path(wD, fileDir))
+    }
+    
+    locF <- localFiles[grepl(paste("d", Year, sep=""), localFiles)]
+    
+    if (!(locF[1] %in% remoteFiles)) {
+        destFile <- remoteFiles[grepl(paste("d", Year, sep=""), remoteFiles)]
+        destDir <- file.path(wDir, fileDir, destFile)
+        download.file(paste(dataUrl, destFile, sep=""), destDir)
+        if (!is.na(locF[1])) {
+            if (!dir.exists(file.path(wDir, fileDir, archiveDir))) {
+                dir.create(file.path(wDir, fileDir, archiveDir))
+            } 
+            file.rename(file.path(wDir, fileDir, locF),
+                        file.path(wDir, fileDir, archiveDir, locF))
+        }
+    }
+}
+
+# Get remote fatalities and details file names from FTP server
+filenames <- strsplit(getURL(dataURL, ftp.use.epsv = FALSE, dirlistonly = TRUE), split = "\n")
+filenames <- unlist(filenames)
+fatalFNames <- filenames[grepl("fatalities", filenames)]
+detailFNames <- filenames[grepl("details", filenames)]
+
+# Get local fatalities and details file names
+localDetFNames <- list.files(file.path(wDir, detailDir))
+localFatFNames <- list.files(file.path(wDir, fatalDir))
+
+# Download the missing/new data and archive old
+for (i in sYear:eYear) {
+    getData(detailFNames, localDetFNames, wDir, i, dataURL, detailDir)
+    getData(fatalFNames, localFatFNames, wDir, i, dataURL, fatalDir)
+}
+```
+
+<img src="/Users/Valentin/Documents/Education/Data Incubator/Interview/fig/locDataStruct.png" />
+
+### Adjustment by inflation
+The first stacked bar plot has two key characteristics which stand out upon quick visual inspection -- a cyclicality and an upward trend in the crop damages over the years. Since the damages were recorded in the current US$ at the time of event, the most likely reason for the upward trend is inflation. Therefore, to allow meaningful comparison of property and crop losses between the years, all the amounts were adjusted by inflation to Dec-2015 dollars. Consumer Price Index (CPI) data has been obtained from the Bureau of Labor Statistics via Quandl.
+
+```{r getCPI, echo=FALSE, cache=TRUE}
+# Get Consumer Price Index for All Urban Consumers: All Items (BLS)
+cpiData <- Quandl("FRED/CPIAUCNS", start_date=as.character(dmy(sDate)), 
+                  end_date=as.character(dmy(eDate)))
+cpiData <- cbind(cpiData, cpiData[,2]/cpiData[1,2])
+names(cpiData) <- c("Date", "CPI", "CPI2015")
+cpiData <- tbl_df(cpiData)
+
+cpiData <- mutate(cpiData, Year = as.integer(year(Date))) %>% 
+           mutate(Month = month(Date, label=TRUE, abbr = FALSE)) %>%
+           select(Year, Month, CPI2015)
+```
+
+Adjustment of the crop damages by CPI produces the following revised plot, where the upward trend has been corrected, but cyclicality is still present.
+
+```{r loadData, echo=FALSE, cache=TRUE}
+# Get updated local fatalities and details file names
+localDetFNames <- list.files(file.path(wDir, detailDir))
+localFatFNames <- list.files(file.path(wDir, fatalDir))
+localDetFNames <- localDetFNames[grep(".csv.gz",localDetFNames)]
+localFatFNames <- localFatFNames[grep(".csv.gz",localFatFNames)]
+
+# Read in the data and convert to tbl_df
+noaaDet <- data.frame()
+noaaFat <- data.frame()
+for (i in 1:length(localDetFNames)) {
+    noaaDet <- rbind(noaaDet, read.csv(file.path(wDir, detailDir, localDetFNames[i])))
+    noaaFat <- rbind(noaaFat, read.csv(file.path(wDir, fatalDir, localFatFNames[i])))
+}
+noaaDet<-tbl_df(noaaDet)
+noaaFat<-tbl_df(noaaFat)
+```
+
+```{r clnDet, echo=FALSE, cache=TRUE}
+noaaClnDet <- mutate(noaaDet, propKdmg=as.numeric(gsub("^0","1",1e3*grepl("(K$)",DAMAGE_PROPERTY)))) %>%
+        mutate(propMdmg=as.numeric(gsub("^0","1",1e6*grepl("(M$)",DAMAGE_PROPERTY)))) %>%
+        mutate(propBdmg=as.numeric(gsub("^0","1",1e9*grepl("(B$)",DAMAGE_PROPERTY)))) %>%
+        mutate(propTdmg=as.numeric(gsub("^0","1",1e12*grepl("(T$)",DAMAGE_PROPERTY)))) %>%
+        mutate(numDmgProp = gsub("(K$)|(M$)|(B$)|(T$)","",DAMAGE_PROPERTY)) %>%
+        mutate(numDmgProp = as.numeric(gsub("^$","0",numDmgProp))*propKdmg*propMdmg*propBdmg) %>%
+    
+        mutate(cropKdmg=as.numeric(gsub("^0","1",1e3*grepl("(K$)",DAMAGE_CROPS)))) %>%
+        mutate(cropMdmg=as.numeric(gsub("^0","1",1e6*grepl("(M$)",DAMAGE_CROPS)))) %>%
+        mutate(cropBdmg=as.numeric(gsub("^0","1",1e9*grepl("(B$)",DAMAGE_CROPS)))) %>%
+        mutate(cropTdmg=as.numeric(gsub("^0","1",1e12*grepl("(T$)",DAMAGE_CROPS)))) %>%
+        mutate(numDmgCrop = gsub("(K$)|(M$)|(B$)|(T$)","",DAMAGE_CROPS)) %>%
+        mutate(numDmgCrop = as.numeric(gsub("^$","0",numDmgCrop))*cropKdmg*cropMdmg*cropBdmg) %>%
+        mutate(econDmg = numDmgCrop+numDmgProp)
+
+noaaClnDet <- merge(noaaClnDet, cpiData, by.x = c('YEAR', 'MONTH_NAME'), by.y = c('Year', 'Month'))
+noaaClnDet <- tbl_df(noaaClnDet) %>%
+            mutate(dmgPropCPI = numDmgProp/CPI2015) %>%
+            mutate(dmgCropCPI = numDmgCrop/CPI2015) %>%
+            mutate(econdDmgCPI = econDmg/CPI2015)
+```
+
+```{r cropCPI, echo=FALSE, fig.align='center', fig.retina=2, fig.asp=1/2, fig.width=10}
+# Analyse crop damages
+topEvents <- group_by(noaaClnDet, YEAR, EVENT_TYPE) %>%
+            tally(dmgCropCPI, sort = TRUE) %>% ungroup()
+
+top3Events <- data.frame()
+for (i in sYear:eYear) {
+    temp <- filter(topEvents,YEAR==i) %>%
+            group_by(YEAR, EVENT_TYPE = factor(c(as.character(EVENT_TYPE[1:3]), rep("Other", n() - 3)),
+                                         levels = c(as.character(EVENT_TYPE[1:3]), "Other"))) %>%
+            tally() %>% ungroup()
+    top3Events <- rbind(top3Events,temp)
+}
+
+top3Events <- group_by(top3Events, YEAR) %>% mutate(totYearDmg = sum(nn))
+
+p <- ggplot(top3Events, aes(x = YEAR, y = nn/1000000000, fill = EVENT_TYPE)) +
+    geom_bar(stat = "identity", colour="black", size = 0.1) +
+    scale_x_continuous(breaks = seq(sYear, eYear, 2)) +
+    labs(list(fill="Event Type", x = "Year", y = 'Crop damages in $B'))
+
+barPalette <- c("#fdbf6f", "#1f78b4", "#b2df8a", "#ffffff", "#fb9a99", "#33a02c", 
+                "#a6cee3", "#ff7f00", "#cab2d6", "#6a3d9a", "#313695", "#b15928",
+                "#e31a1c", "#74add1", "#5e4fa2")
+
+p + scale_fill_manual(values=barPalette)
+```
+
+After all the data has been corrected for CPI it is worth having a look at the total property damages over the years as well, once again highlighting the three largest contributors for each year.
+
+```{r propCPI, echo=FALSE, fig.align='center', fig.retina=2, fig.asp=1/2, fig.width=10}
+# Analyse prop damages
+topEvents <- group_by(noaaClnDet, YEAR, EVENT_TYPE) %>%
+            tally(dmgPropCPI, sort = TRUE) %>% ungroup()
+
+top3Events <- data.frame()
+for (i in sYear:eYear) {
+    temp <- filter(topEvents,YEAR==i) %>%
+            group_by(YEAR, EVENT_TYPE = factor(c(as.character(EVENT_TYPE[1:3]), rep("Other", n() - 3)),
+                                         levels = c(as.character(EVENT_TYPE[1:3]), "Other"))) %>%
+            tally() %>% ungroup()
+    top3Events <- rbind(top3Events,temp)
+}
+
+top3Events <- group_by(top3Events, YEAR) %>% mutate(totYearDmg = sum(nn))
+
+p <- ggplot(top3Events, aes(x = YEAR, y = nn/1000000000, fill = EVENT_TYPE)) +
+    geom_bar(stat = "identity", colour="black", size = 0.1) +
+    scale_x_continuous(breaks = seq(sYear, eYear, 2)) +
+    labs(list(fill="Event Type", x = "Year", y = 'Property damages in $B'))
+
+barPalette <- c("#fdbf6f", "#1f78b4", "#b2df8a", "#ffffff", "#fb9a99", "#33a02c", 
+                "#a6cee3", "#ff7f00", "#cab2d6", "#6a3d9a", "#313695", "#b15928",
+                "#e31a1c", "#74add1", "#5e4fa2")
+
+p + scale_fill_manual(values=barPalette)
+```
+
+### Data inconsistencies
+The previous plot illustrates a significant upshot in the damages in years 2005 and 2006. The 2005 upshot was expected, since that is the year of hurricane Katrina -- one of the most devestating hurricanes in the USA, while over $100B in flood damages in 2006 were not expected, hence this datapoint requires further investigation. Zooming into 2006 flood event type we can see that one particular entry stands out with $115B of reported damages:
+
+```{r outlier, echo=FALSE}
+filter(noaaClnDet, EVENT_TYPE=='Flood' & YEAR == 2006) %>% select(STATE, DAMAGE_PROPERTY, dmgPropCPI) %>% arrange(desc(dmgPropCPI))
+```
+
+The narrative for this event reads:
+```{r narr, echo=FALSE}
+narr <- filter(noaaClnDet, DAMAGE_PROPERTY == '115B', EVENT_TYPE=='Flood' & YEAR == 2006) %>% select(EPISODE_NARRATIVE)
+as.character(narr[[1]])
+```
+It's clear that there's no mention of damages anywhere near the $115B. Doing a web search for this event didn't produce any news reports with billions of dollars of damages either, with <a href="http://napavalleyregister.com/news/local/severe-flooding-hits-napa-valley/article_ebee8598-a512-572a-baea-ca254758614f.html">this</a> article stating that this flood was not as bad as the 1986 one which caused $100M of damages. Thus, most likely this data entry is a mistake and is excluded from further analysis. The revised plot for property damages over the years highlighting the top three events is shown below.
+
+```{r propCPIRev, echo=FALSE, fig.align='center', fig.retina=2, fig.asp=1/2, fig.width=10}
+#Remove California flood data, which seems like an outlier
+noaaClnDet <- filter(noaaClnDet, DAMAGE_PROPERTY != '115B')
+
+# Analyse prop damages
+topEvents <- group_by(noaaClnDet, YEAR, EVENT_TYPE) %>%
+            tally(dmgPropCPI, sort = TRUE) %>% ungroup()
+
+top3Events <- data.frame()
+for (i in sYear:eYear) {
+    temp <- filter(topEvents,YEAR==i) %>%
+            group_by(YEAR, EVENT_TYPE = factor(c(as.character(EVENT_TYPE[1:3]), rep("Other", n() - 3)),
+                                         levels = c(as.character(EVENT_TYPE[1:3]), "Other"))) %>%
+            tally() %>% ungroup()
+    top3Events <- rbind(top3Events,temp)
+}
+
+top3Events <- group_by(top3Events, YEAR) %>% mutate(totYearDmg = sum(nn))
+
+p <- ggplot(top3Events, aes(x = YEAR, y = nn/1000000000, fill = EVENT_TYPE)) +
+    geom_bar(stat = "identity", colour="black", size = 0.1) +
+    scale_x_continuous(breaks = seq(sYear, eYear, 2)) +
+    labs(list(fill="Event Type", x = "Year", y = 'Property damages in $B'))
+
+barPalette <- c("#fdbf6f", "#1f78b4", "#b2df8a", "#ffffff", "#fb9a99", "#33a02c", 
+                "#a6cee3", "#ff7f00", "#cab2d6", "#6a3d9a", "#313695", "#b15928",
+                "#e31a1c", "#74add1", "#5e4fa2")
+
+p+scale_fill_manual(values=barPalette)
+```
+
+It's staggering how much of an outlier the hurricane Katrina event is...
+
+### Frequent and devastating
+Using the above corrected data we can identify the events which consistenly are among the top three culprits behind the property damages:
+```{r pDmgTbl, echo=FALSE}
+table(filter(top3Events, EVENT_TYPE !="Other")$EVENT_TYPE)
+```
+
+```{r fFtot, echo=FALSE, results='hide'}
+fFDmgs <- group_by(noaaClnDet, YEAR, EVENT_TYPE) %>% tally(dmgPropCPI, sort = TRUE) %>%
+        filter(EVENT_TYPE == "Flash Flood")
+fFtot <- round(sum(fFDmgs$n)/1e9,0)
+```
+
+These are floods, flash floods and tornados. Despite causing relatively small damages in any given year, compared to single major events like Katrina, their devastating consequencies do add up over time. Such, for example, flash floods are responsible for $`r fFtot`B of inflation adjusted losses in the last 20 years.
+
+### Seasonality
+Certain seasonality is expected in the crop damages, but it is useful to investigate if there is a seasonal effect in the property damages as well. This information could be useful for planning the disaster relief efforts as well as for example for the insurance companies in forcasting the rise in insurance claims. We know that there's a large outlier in 2005 due to Katrina, thus we exclude this year from the subsequent plots, to get an idea of what the losses in *normal* years are. The following are the inflation-adjusted seasonal damages to crops and property.
+
+```{r propDmgSeason, echo=FALSE, fig.align='center', fig.retina=2, fig.asp=1/2}
+Months <- month(seq(as.Date("2014-12-01"), as.Date("2015-11-01"), by="months"), label=TRUE, abbr=FALSE)
+Seasons <- rep(c("Winter", "Spring", "Summer", "Autumn"),each=3)
+seasonLookup <- data.frame(Months, Seasons)
+noaaClnDet <- merge(noaaClnDet, seasonLookup, by.x = c("MONTH_NAME"), by.y = c("Months"))
+noaaClnDet <- tbl_df(noaaClnDet)
+
+seasonDmg <- group_by(noaaClnDet, YEAR, Seasons) %>% 
+            summarise(seasonPropDmg = sum(dmgPropCPI), seasonCropDmg = sum(dmgCropCPI))
+seasonDmgProp <- filter(seasonDmg, YEAR != 2005)
+
+g <- ggplot(seasonDmgProp, aes(x=factor(Seasons), y=seasonPropDmg/1e9)) +
+    geom_violin(draw_quantiles = c(0.25, 0.5, 0.75), fill = "#a6cee3") +
+    labs(x = 'Season', y = 'Propery Damages $B') + theme(legend.position="none")
+    # scale_y_log10()
+g
+
+g <- ggplot(seasonDmg, aes(x=factor(Seasons), y=seasonCropDmg/1e9)) +
+    geom_violin(draw_quantiles = c(0.25, 0.5, 0.75), fill = "#fdbf6f") +
+    labs(x = 'Season', y = 'Crop Damages $B') + theme(legend.position="none")
+g
+```
+
+Both of the plots suggest that there is large variability between years, where the majority of the losses usually fall below $5B for property and below $1B for crops, there are several years with dramatically higher losses in a given season.
+
+To investigate if damages to crops and property on average exhibit any statistical differences between seasons we run pairwise t-tests with correction for multiple testing.
+
+```{r seasonDmgTest, echo = FALSE}
+"Property"
+propTtest <- pairwise.t.test(seasonDmgProp$seasonPropDmg, seasonDmgProp$Seasons, pool.sd=F, alternative=c("two.sided"))
+propTtest
+
+"Crops"
+cropTtest <- pairwise.t.test(seasonDmg$seasonCropDmg, seasonDmg$Seasons, pool.sd=F, alternative=c("two.sided"))
+cropTtest
+```
+
+At 95% significance we conclude that the average property damages in Winter are different from property damages in Spring or Summer (p-values: `r round(propTtest$p.value[3,2],3)` and `r round(propTtest$p.value[3,3],3)`, respectively). Referring to the earlier violin plot for property damages and using the results of this t-test we can conclude that Winter is the best season of the year showing the lowest level of property damages.
+
+Similary and as expected at 95% significance Summer is the worst season in terms of average crop damages compared to Winter or Spring (p-values: `r round(cropTtest$p.value[3,3],3)` and `r round(cropTtest$p.value[2,2],3)`, respectively) and in fact the test is borderline significant compared to Autumn as well.
+
+### Loss of life resulting from storm events
+In addition to the main database NOAA publishes a complimentary dataset which logs all direct and indirect fatalities resulting from storm events. Analysis of this data is useful for establishing any bias towards a particular sex, age or location. Such information can be used to inform the choice of most suitable disaster notification methods, prioritise preparation of rescue services, etc.
+
+```{r locSexFat, echo=FALSE, fig.align='center', fig.retina=2, fig.asp=1, fig.width=10}
+noaaClnFat <- mutate(noaaFat, fatDate = mdy_hms(FATALITY_DATE)) %>%
+            mutate(Year = year(fatDate), Month = month(fatDate))
+noaaClnFat$FATALITY_SEX <- mapvalues(noaaClnFat$FATALITY_SEX, 
+                                     c("M","F",""), c("Male", "Female", NA))
+
+g <- ggplot(noaaClnFat, aes(x=FATALITY_AGE, fill=FATALITY_SEX)) + geom_histogram(binwidth=2) +
+        facet_wrap(~FATALITY_LOCATION, ncol = 4) + theme(legend.position="top") + 
+        scale_fill_manual(values=c("#ef8a62", "#67a9cf"), name="Fatality Sex", 
+                          breaks=c("Female", "Male"), labels=c("Female", "Male")) +
+        labs(x = 'Fatality Age',y='Count')
+g
+```
+
+It is evident from the above plot that 5 key locations dominate, excluding the *Other* category, these are:
+
+1. *In Water*;
+2. *Mobile/Trailer Home*;
+3. *Outside/Open Areas*;
+4. *Permanent Home*;
+5. *Vehicle/Towed Trailer*.
+    
+Addtionally, there are several interesting points to note in relation to some of the subplots. Such, we can observe a distinct jump in the number of male fatalities between the ages of 15 and 25 *In Water*. The number of male fatalities in at least 3 out 5 of these categories is significantly higher than the number of female fatalities -- *In Water*, *Outside/Open Areas* and *Vehicle/Towed Traler*. Between the ages of 5 and 15 there is a trough in the number of both male and female fatalities in *Vehicle/Towed Trailer*, followed by a rapid increase at around the age of 15. Finally, the number of fatalities at *Permanent Home* increases rapidly after approximately the age of 50, which could imply that elderly people, because they are less mobile, tend to not be able to seek shelter outside their home.
+
+### The Deadliest Storms
+To get insight about which storms result in the largest number of deaths, it is required to combine the fatalities data subset with the main storm database in order to produce the required multifaceted plot. Doing this and filtering events which have led to more than 60 deaths over the last 20 years, results in the following illustration of the deadliest storm events.
+
+```{r fatEvent, echo=FALSE, fig.align='center', fig.retina=2, fig.asp=1, fig.width=10}
+detFilt <- select(noaaClnDet, EVENT_ID, STATE, EVENT_TYPE)
+newFat <- merge(noaaClnFat, detFilt, by.x = "EVENT_ID", by.y = "EVENT_ID")
+newFat <- tbl_df(newFat)
+
+sumNewFat <- group_by(newFat, EVENT_TYPE) %>% tally(sort = TRUE)
+sigFatEvents <- filter(sumNewFat, n>60)$EVENT_TYPE
+
+g <- ggplot(subset(newFat, newFat$EVENT_TYPE %in% sigFatEvents), aes(x=FATALITY_AGE, fill=FATALITY_SEX)) + geom_histogram(binwidth=2) +
+        facet_wrap(~EVENT_TYPE, ncol = 5) + theme(legend.position="top") + 
+        scale_fill_manual(values=c("#ef8a62", "#67a9cf"), name="Fatality Sex", 
+                          breaks=c("Female", "Male"), labels=c("Female", "Male")) +
+        labs(x = 'Fatality Age',y='Count')
+g
+```
+
+A number of interesting observations can be made on the above plot:
+
+1. Our previous hypothesis that elderly people are less mobile and thus less able to seek shelter outside their home is both confirmed and challenged by this plot. We can clearly see that *Heat* affects most the youngest members of the population as well as the oldest. At the same time *Hurricane (Typhoon)* shows a similar upwards trend with age, but most likely the *Heat* event type dominates this effect.
+2. Now we can see that the upshot in the number of male fatalities *In Water* observed previously is most likely attributable to the *Rip Current* event type.
+3. The distribution of fatalities with *Tornadoes* is the closest to Gaussian of all event types with a relatively thick lower tail. Furthermore the split between male and female fatalities seems to be close to 50/50.
+
+### Geographical distribution of fatalities
+To assess and plan the response of medical emergency services it is useful to visualise the geographical distribution of fatalities across the country. This can be done in a similar way to plot 2 produced for the challenge.
+
+```{r fatGeo, echo=FALSE, fig.align='center', cache=TRUE, fig.retina=2, fig.asp=1/2, fig.width=10}
+mapFat <- group_by(newFat, STATE) %>% tally(sort=TRUE)
+region <- c(tolower(mapFat$STATE))
+value <- c(mapFat$n)
+fatMapDf <- data.frame(region,value)
+
+mapPalette <- c("#f1eef6", "#d0d1e6", "#a6bddb", "#74a9cf", "#3690c0", "#0570b0", "#034e7b")
+choro = StateChoropleth$new(fatMapDf)
+choro$ggplot_scale = scale_fill_manual(name="Number of fatalities", values=mapPalette, drop=FALSE)
+choro$render()
+```
+
+Based on the above plot it's mid-east US as well as Florida and California, which have the largest absolute number of fatalities resulting from severe weather events.
+
+Furthermore, it is useful to assess the *fatality rate* as proportion of the overall population of a given State. To acheive this the fatality counts must be adjusted by the population of every state for every year of interest (1996 -- 2015). The following plot summarise the average fatality rates across USA, where the census data has been obtained from the Federal Reserve via Quandl.
+
+```{r getCensusData, cache=TRUE, echo=FALSE}
+stateCodes <- read.csv(file.path(wDir, "states.csv"))
+
+Quandl.api_key("sePeQyKe2zAvzjAXLvcW")
+stateCensus <- Quandl(paste("FRED/",stateCodes[1,2],"POP", sep=""),
+                  start_date=as.character(dmy(sDate)), 
+                  end_date=as.character(dmy(eDate)))
+
+for (i in 2:dim(stateCodes)[1]) {
+    stateCensus <- cbind(stateCensus, 
+                         Quandl(paste("FRED/",stateCodes[i,2],"POP", sep=""),
+                                start_date=as.character(dmy(sDate)),
+                                end_date=as.character(dmy(eDate)))$VALUE)
+}
+names(stateCensus) <- c("Date", as.character(stateCodes$State))
+censusCln <- melt(stateCensus, id.vars = "Date", variable.name = "State", 
+                    value.name = "Population") %>%
+                mutate(Date = year(Date), State = tolower(State))
+```
+```{r adjustFatState, echo=FALSE, fig.align='center', cache=TRUE, fig.retina=2, fig.asp=1/2, fig.width=10}
+fatCln <- group_by(newFat, Year, STATE) %>% tally() %>% mutate(STATE = tolower(STATE))
+
+adjFatMap <- merge(fatCln, censusCln, by.x = c("Year", "STATE"), 
+                   by.y = c("Date", "State")) %>%
+                mutate(fatRate = n/Population) %>% select(Year, STATE, fatRate) %>%
+                dplyr::group_by(STATE) %>%
+                dplyr::summarise(value = sum(fatRate)/(eYear-sYear+1))
+
+names(adjFatMap) <- c("region", "value")
+
+mapPalette <- c("#f1eef6", "#d0d1e6", "#a6bddb", "#74a9cf", "#3690c0", "#0570b0", "#034e7b")
+choro = StateChoropleth$new(adjFatMap)
+choro$ggplot_scale = scale_fill_manual(name="Fatalities/1000/year", values=mapPalette, drop=FALSE)
+choro$render()
+```
+
+The proportion of fatalities map is quite different from that showing the cumulative absolute fatalities count. Here, for example, we can see that the rate of fatalities per 1000 people in California is low and Texas is no longer at the top of the list.
+
+### Male vs. Female fatalities
+We've made an interesting observation earlier, where it looked like over the years there have been more male than female fatalities as a result of severe weather events. It will be useful to see if this difference is statistically significant.
+
+```{r MFFat, echo=FALSE, fig.align='center', cache=TRUE, fig.retina=2, fig.asp=1/2, fig.width=10}
+newFat <- mutate(newFat, abbrDate = ymd(FAT_YEARMONTH, truncated = 2))
+timeFat <- group_by(filter(newFat, FATALITY_SEX != "NA"), abbrDate, FATALITY_SEX) %>% tally()
+
+glm1 <- glm(n ~ abbrDate + FATALITY_SEX, data=timeFat, family = "poisson")
+coeff <- exp(glm1$coefficients)
+p.value <- summary(glm1)$coefficients[,4]
+names(coeff) <- c("Ave. Female (Intercept)", "Date", "Male")
+names(p.value) <- c("Ave. Female (Intercept)", "Date", "Male")
+
+rbind(coeff, p.value)
+
+g <- ggplot(timeFat, aes(x=abbrDate, y=n, color = FATALITY_SEX)) +
+    geom_point(size = 3) + 
+    geom_smooth(method = "glm", method.args = list(family = "poisson")) +
+    coord_cartesian(ylim = c(0, 100)) + 
+    scale_colour_manual(values=c("#ef8a62", "#67a9cf"), name="Fatality Sex",
+                          breaks=c("Female", "Male"), labels=c("Female", "Male")) + 
+    labs(x = "Date", y= "Count")
+g
+```
+
+We fit the poisson generalized model to the data which reveals that there is no statistically significant upward tendency in the number of fatalities per month through the years (*Date* coefficient is 1). The average number of Female fatalities per month is `r round(coeff[[1]],1)`, while the average number of Male fatalities per month is `r round((coeff[[3]]-1)*100,0)`% higher, thus confirming our previous observation. P-values for all coefficients indicate high statistical significance.
+
+
+
+
+
+
